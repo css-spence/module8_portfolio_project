@@ -1,0 +1,347 @@
+---
+title: "Analysis of Violent Crime in New York City"
+author: "Christopher Spence"
+date: "3/7/2020"
+output:
+  html_document: 
+    code_folding: hide
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# New York City Violent Crime Analysis 
+
+This project involves the systematic formulation of hypotheses and a study of the temporal and spatial distribution of five years of violent crimes in New York City using exploratory data analysis techniques and statistical methods to help law enforcement agencies make better decisions for the efficacious reduction of crime.
+
+The statistical methods used to make a recommendation for developing an effective crime prevention strategy include:
+
+- Frequency distribution, charts, and maps to see the frequency of crimes in New York City by type of offense, time of day, by season, and how crimes are spread out spatially on a map to identify hotspots. 
+
+- Calculate and interpret the relationship between increased police patrols and crimes in each borough using the paired t-test to determine if an increase in policing activities will influence crime rates.
+
+- Produce a linear regression model against a training crime dataset and compare the predicted counts against the actual counts on a plot to validate the model.
+
+```{r Load Libraries, echo=FALSE, results="hide"}
+packages <- c("caTools","chron","dplyr","ggplot2","lubridate","leaflet","readr","RColorBrewer","rgdal", "DBI", "sp" ,"tidyr")
+invisible(suppressWarnings(lapply(packages, library, character.only = TRUE)))
+```
+
+```{r Setup Environment Variables, echo=FALSE}
+# Define variables used for file I/O operations 
+dataPath <- "/RDATA/NYCOpenData/"
+dataFile <- paste0(dataPath,"complaints/NYPD_Complaint_Data_Historic.csv")
+censusFile <- paste0(dataPath,"population/New_York_City_Population_by_Borough__1950_-_2040.csv")
+geoFile <- paste0(dataPath,"/maps/Borough Boundaries.geojson")
+# Define variables used for database operations
+databaseName <- "crime.db" 
+dbTableName <- "complaints"
+selectStatement <- paste0("SELECT * FROM ", dbTableName)
+# Define variables for data wrangling operations
+timeBuckets<- chron(times=c('00:00:00', '06:00:00', '12:00:00', '18:00:00','23:59:00'))
+timeLabels <- c('00-06','06-12', '12-18', '18-00')
+requiredCols <- c("CMPLNT_FR_TM", "ADDR_PCT_CD", "OFNS_DESC", "BORO_NM","Latitude","Longitude")
+uniqueKeys <- c("RPT_DT","CMPLNT_FR_TM","ADDR_PCT_CD","KY_CD", "CRM_ATPT_CPTD_CD","Latitude","Longitude")
+yearFilter <- c(2018,2017,2016,2015,2014,2013,2012,2011,2010,2009) 
+ageGroups <- c("18-24","25-44","45-64","<18","65+")
+violentOffenses <- c("BURGLARY","ROBBERY","FELONY ASSAULT",                 
+   "FELONY SEX CRIMES","SEX CRIMES",
+   "HOMICIDE-NEGLIGENT-VEHICLE","HOMICIDE-NEGLIGENT,UNCLASSIFIE",
+   "MURDER & NON-NEGL. MANSLAUGHTER","RAPE")
+```
+
+## Data Preparation
+
+The raw dataset used for this analysis includes all valid felony, misdemeanor, and violation crimes reported to the New York City Police Department (NYPD) from 2006 to 2018. The data wrangling process loads, transforms, and maps the data into a data frame, and removes empty rows and duplicate data. 
+
+The size of the NYPD Complaint Data Historic dataset is 2GB and contains over 6.8 million observations. After the initial wrangling of the source data, it is stored into a local SQL Lite database for faster retrieval, so subsequent executions of this notebook are more efficient. This EDA process will only evaluate the last five years of violent crime data.
+
+```{r Load Historical Crime Data, echo=TRUE}
+db <- dbConnect(RSQLite::SQLite(), dbname = paste0(dataPath,databaseName))
+# If the complaints database table does not exist, reload and transform the historic data file
+existsFlag <- dbExistsTable(db, dbTableName)
+if (!existsFlag) {
+     sprintf("Loading file  %s", dataFile)
+     temp.data <- read_csv(dataFile,col_types = cols(CMPLNT_FR_DT = col_skip(), 
+                                       CMPLNT_FR_TM = col_time(format = "%H:%M:%S"),
+                                       RPT_DT = col_date(format = "%m/%d/%Y"),
+                                       PD_CD = col_skip(), PD_DESC = col_skip(),
+                                       CMPLNT_TO_DT = col_skip(), CMPLNT_TO_TM = col_skip(), 
+                                       HADEVELOPT = col_skip(), HOUSING_PSA = col_skip(), 
+                                       JURISDICTION_CODE = col_skip(), JURIS_DESC = col_skip(), 
+                                       Lat_Lon = col_skip(), PARKS_NM = col_skip(),
+                                       STATION_NAME = col_skip(), PATROL_BORO = col_skip(), 
+                                       TRANSIT_DISTRICT = col_skip(), X_COORD_CD = col_skip(), 
+                                       Y_COORD_CD = col_skip()))
+   # Remove rows from the temporary dataframe that have missing values in required columns
+   temp.data <- temp.data[complete.cases(temp.data[requiredCols]),]
+   # Keep data with known age groups and genders for the last five years 
+   temp.data <- temp.data %>% 
+      filter(year(RPT_DT) %in% yearFilter & LAW_CAT_CD == "FELONY" & OFNS_DESC %in% violentOffenses)
+   # Remove duplicate data
+   temp.data <- subset(temp.data, !duplicated(temp.data[uniqueKeys]))
+   # Enrich the dataset with date, season, and time buckets
+   complaint.data <- temp.data %>% 
+      mutate(TIME.BUCKET=cut(chron(times=CMPLNT_FR_TM), breaks=timeBuckets, labels=timeLabels, include.lowest=TRUE),
+             WEEKDAY=weekdays(RPT_DT, abbreviate=TRUE), MONTH=months(RPT_DT, abbreviate=TRUE), YEAR=year(RPT_DT),
+             REPORT_DATE=as.character(RPT_DT), REPORT_TIME=as.character(CMPLNT_FR_TM),
+             SEASON=case_when(month(RPT_DT) %in% c(3,4,5) ~ "Spring",month(RPT_DT) %in% c(6,7,8) ~ "Summer",
+                              month(RPT_DT) %in% c(9,10,11) ~ "Autumn",month(RPT_DT) %in% c(12,1,2) ~ "Winter" ),
+             OFFENSE_TYPE=case_when(OFNS_DESC %in% c("SEX CRIMES","FELONY SEX CRIMES","RAPE") ~ "SEXUAL ASSAULT",
+             OFNS_DESC %in% c("BURGLARY","ROBBERY") ~ "ROBBERY",
+             OFNS_DESC %in% c("HOMICIDE-NEGLIGENT,UNCLASSIFIE","HOMICIDE-NEGLIGENT-VEHICLE") ~ "HOMICIDE",
+             TRUE ~ OFNS_DESC))
+   # Remove report date and time columns from the dataframe
+   complaint.data <- subset(complaint.data, select = -c(CMPLNT_FR_TM, RPT_DT))
+   # Write the contents of the dataframe into the database table.
+   dbWriteTable(db, dbTableName, complaint.data, overwrite = TRUE)
+   # Release memory used to store temporary data frame
+   rm(list = c("temp.data"))
+} else {
+  # If the complaint table exists, load the transformed data into the data frame.
+  sprintf("Loading data from  %s", dbTableName)
+  complaint.data<-dbGetQuery(db, selectStatement)
+}     
+# Disconnect from the database   
+dbDisconnect(db)
+unlink(databaseName)
+# Filter data to the last five years.
+complaint.data <- complaint.data %>% filter(YEAR %in% c(2018,2017,2016,2015,2014))
+# Load population data
+population.data <- read.csv(censusFile,stringsAsFactors=FALSE) %>%  
+   filter(Borough != "NYC Total") %>% 
+   subset(select = c(Borough,X2010)) %>%
+   mutate(Borough = toupper(trimws(Borough)))
+names(population.data) <- c("BORO_NM","POPULATION")
+```
+
+# Perform Exploritory Analysis (EDA)
+
+##  Historical Violent Crime Trend Analysis
+
+This line plot shows a five-year historical trend of violent crimes per capita within each of the following county-level administrative divisions or boroughs in New York City: The Bronx, Brooklyn, Manhattan, Queens, and Staten Island.
+
+```{r Historical Crime Rate, echo=TRUE}
+crime.trend <-complaint.data %>% count(YEAR, BORO_NM, name="FREQUENCY") %>% 
+   inner_join(population.data, by="BORO_NM") %>% 
+   mutate(CRIME_RATE=FREQUENCY / POPULATION * 100000)
+trend.plot <- ggplot(crime.trend, aes(x=YEAR, y=CRIME_RATE, group = BORO_NM, color= BORO_NM)) +
+   geom_line() + ggtitle("VIOLENT OFFENCES PER CAPITA BY BOROUGH") + 
+   theme(plot.title = element_text(hjust = 0.5)) + 
+   labs(color="BOROUGH")
+trend.plot
+```
+
+### Observations
+
+The line plot shows that the number of violent crimes in New York City steadily decreased over five years. However, Manhattan experienced a rise in violent crime between 2017 and 2018.
+
+## Seasonal Effect on Violent Crime
+
+The purpose of this chart is to explore the seasonality of violent crimes in New York City.
+
+```{r Crimes by Season, echo=TRUE}
+seasonal.data <- complaint.data %>% 
+   count(SEASON, OFFENSE_TYPE, name="FREQUENCY") %>%
+   mutate(SEASON = factor(SEASON, levels = c("Spring", "Summer", "Autumn","Winter")))
+
+seasonal.plot <- ggplot(seasonal.data, aes(x = SEASON, y = FREQUENCY, fill=OFFENSE_TYPE, label=FREQUENCY)) + 
+   geom_bar(stat = "identity") + 
+   scale_fill_brewer(palette="Spectral") + 
+   labs(fill="OFFENSE") + 
+   ggtitle("VIOLENT OFFENSES BY SEASON") +
+   theme(plot.title = element_text(hjust = 0.5))
+seasonal.plot
+```
+
+### Observations
+
+The rate of violent crimes peaked over the Summer and dipped during the Winter. Robbery and felony assault were the highest types of violent crimes.
+
+## Distribution of violent offenses by the day of the week
+
+The purpose of this chart is to identify the day of the week that violent crimes occur during Summer.
+
+```{r Crimes by Week, echo=TRUE}
+weekly.crimes <- complaint.data %>% 
+   filter(YEAR == 2018 & SEASON == "Summer") %>% 
+   count(WEEKDAY, OFFENSE_TYPE, name="FREQUENCY") %>%
+   mutate(WEEKDAY = factor(WEEKDAY, levels = c("Sun","Mon", "Tue", "Wed", "Thu", "Fri", "Sat"))
+   )
+
+weekly.plot <- ggplot(weekly.crimes, aes(x = WEEKDAY, y = FREQUENCY, fill=OFFENSE_TYPE, label=FREQUENCY)) + 
+   geom_bar(stat = "identity") + 
+   scale_fill_brewer(palette="Spectral") + 
+   labs(fill="OFFENSE") + 
+   ggtitle("VIOLENT CRIMES BY WEEKDAY") +
+   theme(plot.title = element_text(hjust = 0.5))
+weekly.plot
+```
+
+### Observations
+
+This plot shows that most violent offences occur on a Monday during the Summer.
+
+## Distribution of violent crime by time of the day 
+
+The final step in the temporal exploratory analysis of the distribution of violent crimes involves looking for the time ranges that most violent crimes occur during the Summer.
+
+```{r Crimes by Time, echo=TRUE}
+hourly.crimes <- complaint.data %>% 
+   filter(YEAR == 2018 & SEASON == "Summer")  %>% 
+   count(TIME.BUCKET, OFFENSE_TYPE, name="FREQUENCY") %>%
+   mutate(TIME.BUCKET = factor(TIME.BUCKET, levels = timeLabels)
+   )
+time.plot <- ggplot(hourly.crimes, aes(x = TIME.BUCKET, y = FREQUENCY, fill=OFFENSE_TYPE, label=FREQUENCY)) + 
+   geom_bar(stat = "identity") + 
+   scale_fill_brewer(palette="Spectral") + 
+   labs(fill="OFFENSE") + 
+   ggtitle("VIOLENT CRIMES BY TIME OF DAY") +
+   theme(plot.title = element_text(hjust = 0.5))
+time.plot
+```
+
+### Observations
+
+Violent crimes committed during the Summer of 2018, peaked between the hours 6:00 pm to midnight. The number of violent offenses dip between the hours of 6 am to noon.
+
+# Spatial analysis of Violent Crimes 
+
+This interactive geographical view shows clusters of attempted and committed violent crimes that occurred during the Summer of 2018 on Mondays between the hours of 6:00 pm to Midnight.
+
+```{r Spatial, echo=TRUE}
+mhSPDF <- geojsonio::geojson_read(geoFile, what = "sp")
+
+spatial.data <- complaint.data %>%  
+    filter(YEAR == 2018 & SEASON == "Summer" & WEEKDAY == "Mon" & TIME.BUCKET == "18-00") %>%
+    mutate(POPUP = paste0("<b>Offence #: </b>", OFNS_DESC ,"<br>",
+                          "<b>Date and Time : </b>", paste0(REPORT_DATE," ",REPORT_TIME) ,"<br>",
+                          "<b>Premises Type : </b>",PREM_TYP_DESC, "<br>",
+                          "<b>Precinct Number : </b>",ADDR_PCT_CD  , "<br>"))
+
+map.plot <- leaflet(spatial.data) %>% 
+   setView(lng = -73.7949, lat = 40.7282, zoom = 11) %>%
+   addTiles() %>%
+   addMarkers(lng = ~spatial.data$Longitude, lat = ~spatial.data$Latitude, popup = spatial.data$POPUP, clusterOptions = markerClusterOptions()) %>%
+   addPolygons(data = mhSPDF, highlightOptions = highlightOptions(color="black", weight=3, bringToFront = T),
+               label = mhSPDF$boro_name, weight = 1, fillColor = topo.colors(5, alpha = 0.8), stroke = F)
+map.plot
+```
+
+# Statistical Analysis of Violent Crime
+
+In this stage of the crime analysis, a paired two-sided t-test is performed to examine the difference in means for crime rates before and after changes were made to policing activities. The following hypothesis test will help the analyst understand the effectiveness increased policing activities will have on the frequency of violent crimes.
+
+The null hypothesis claims that an increase in policing will not produce a significant difference in the mean distribution of violent crime rates.
+
+Null Hypothesis (H0): The mean difference in crime is 0
+
+Alternative Hypothesis (H1): The mean difference in crime =/= 0
+
+```{r Crimes by precinct, echo=TRUE}
+precinct.data <-complaint.data %>% 
+   filter(YEAR %in% c(2014,2018)  & SEASON == "Summer") %>%
+   count(YEAR, ADDR_PCT_CD, name="FREQUENCY") %>% 
+   pivot_wider(names_from = YEAR, values_from = FREQUENCY)
+names(precinct.data) <- c("ADDR_PCT_CD", "BEFORE.FREQUENCY","AFTER.FREQUENCY")
+```
+
+
+## Perform a correlation test
+
+Calculate the correlation coefficient to determine whether there is a strong positive linear relationship between the rate of crime in 2014 and 2018. 
+
+```{r evaluate correlation, echo=TRUE}
+cor.test(precinct.data$BEFORE.FREQUENCY, precinct.data$AFTER.FREQUENCY ,method = 'pearson')
+```
+
+### Observations
+
+The calculated correlation coefficient of 0.9204414 indicates that there is a strong positive linear relationship between the rate of crime in 2014 and 2018. Therefore, one can conclude that a movement in the rate of violent crimes in 2014 will have a strong influence on the number of violent crimes in 2018.
+
+## Show box and scatter plots
+
+```{r evaluate difference, echo=TRUE}
+boxplot(precinct.data$BEFORE.FREQUENCY, precinct.data$AFTER.FREQUENCY, main="DISTRIBUTION OF CRIMES")
+plot(precinct.data$BEFORE.FREQUENCY, precinct.data$AFTER.FREQUENCY, col="blue", 
+     xlab = "Crimes before policing incr.", ylab="Crimes after policing incr.", main="AGREEMENT PLOT")
+abline(a=0, b=1)
+```
+
+### Observations
+
+The box plot shows evidence that there was a decrease in the rate of violent crimes. The agreement scatter plot also indicates similar evidence since most points fall below the line.
+
+## Perform t-test
+
+```{r t-test, echo=TRUE}
+t.test(precinct.data$BEFORE.FREQUENCY, precinct.data$AFTER.FREQUENCY, paired = TRUE, alternative = "two.sided")
+```
+
+### Observations
+
+The output from the t-test shows the calculated p-value, 0.0000003533 (3.533e-07), is significantly lower than α=0.05, so there is statistical evidence that an increase in policing during the summer months will affect the rate of violent crimes. Therefore the null hypothesis must be rejected since it claims that an increase in police activity would not produce a significant difference in the mean distribution of the rate of violent crimes.
+
+# Predict Violent Crime Using Linear Regression
+
+During this phase of the statistical analysis of violent crime, a linear regression model will be used to predict violent crime in personal residences within all NYPD precincts. Data is collected for violent crimes that occurred in private homes in 2018 and were committed by high-risk perpetrators. These individuals include black male offenders who are between the ages of 25 - 44.
+
+```{r collect crime data, echo=TRUE}
+crimeDF <- complaint.data %>% filter(OFNS_DESC %in% violentOffenses & YEAR==2018) %>% 
+    mutate(HIGH_RISK_PERP= case_when(SUSP_RACE == "BLACK" & SUSP_SEX=="M" & SUSP_AGE_GROUP== "25-44" ~ 1, TRUE ~ 0), RESIDENTIAL = case_when(PREM_TYP_DESC %in% c("RESIDENCE-HOUSE", "RESIDENCE - APT. HOUSE","RESIDENCE - PUBLIC HOUSING") ~ 1, TRUE ~0), REPORT_DATE = as.Date(REPORT_DATE)) %>% select(CMPLNT_NUM, REPORT_DATE, ADDR_PCT_CD, HIGH_RISK_PERP, RESIDENTIAL)
+# Get total count of crimes by precint
+temp.df1<- crimeDF %>% count(ADDR_PCT_CD, name="TOTAL_CRIMES")
+temp.df2<- crimeDF %>% filter(HIGH_RISK_PERP==1) %>% count(ADDR_PCT_CD, name="HIGH_RISK_OFFENDER_CRIMES")
+crimeDF <- temp.df1 %>% left_join(temp.df2, by="ADDR_PCT_CD")
+crimeDF[is.na(crimeDF)] = 0
+crimeDF <- crimeDF[2:3]
+```
+
+## Prepare Training and Test Datasets for the Linear Model
+
+Prepare the training and testing datasets, display some supporting summary statistics, and determine whether there is a stong linear relationship between the variables.
+
+```{r split crime data, echo=TRUE}
+trainIndex <- sample(1:nrow(crimeDF), 0.7 * nrow(crimeDF))
+testIndex <- setdiff(1:nrow(crimeDF), trainIndex)
+training.data <- crimeDF[trainIndex,]
+test.data <- crimeDF[testIndex,]
+
+# Provide some summary statistics
+summary(crimeDF)
+cor(crimeDF$TOTAL_CRIMES, crimeDF$HIGH_RISK_OFFENDER_CRIMES)
+ggplot(crimeDF, aes(HIGH_RISK_OFFENDER_CRIMES, TOTAL_CRIMES)) +
+   geom_point() + stat_smooth(method = lm) + 
+   labs(x = "High risk offender crimes", y = "Total Crimes") + 
+   ggtitle("FIT PLOT FOR VIOLENT CRIMES") + 
+   theme(plot.title = element_text(hjust = 0.5))
+```
+
+### Observations
+
+The statistical tests show that there is a strong linear relationship between all violent crimes and crimes committed by black males who are between the ages of 25 and 44. The diagnostic plot indicates a narrow fit for predicting crime rates from the sample.
+
+## Predict the Rate of Violent Residential Crimes
+
+This process performs the following tasks:
+
+- Train the Linear regression model using the training data.
+- Produce a summary of the model.
+- Predict violent residential crime rates based on the number of high-risk offenders using the trained model against the test data set.
+- Compare the prediction of violent residential crimes against the actual crime rates.
+
+```{r predict crimes, echo=TRUE}
+model <- lm(TOTAL_CRIMES ~., data=training.data)
+summary(model)
+prediction <- predict(model, test.data)
+plot(test.data$TOTAL_CRIMES, type="l", lty = 1.8, col="red", ylab="Total crimes",main="COMPARISON BETWEEN PREDICTED AND ACTUAL CRIMES")
+lines(prediction, type="l", col="blue")
+legend("topright", legend=c("Actual","Predicted"), col=c("red","blue"),lty=1:2, cex=0.8 , bty="n")
+```
+
+### Observations
+
+This plot shows evidence that there is a tendency for annual violent residential crimes to rise with an increase in the number of high-risk offenders. The plot also indicates that the prediction model results align closely with the actual rate of violent crimes. 
+
